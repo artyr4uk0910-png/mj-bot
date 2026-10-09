@@ -1,6 +1,7 @@
 const dns = require('dns');
 if (dns.setDefaultResultOrder) dns.setDefaultResultOrder('ipv4first');
 
+const https = require('https');
 const { Client, GatewayIntentBits } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 const http = require('http');
@@ -10,11 +11,54 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
 if (!DISCORD_TOKEN || !SUPABASE_URL || !SUPABASE_KEY) {
-    console.error('❌ Не заданы переменные окружения: DISCORD_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_KEY');
+    console.error('❌ Не заданы переменные окружения');
     process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+// === IPv4-only agent для Supabase ===
+const ipv4Agent = new https.Agent({
+    keepAlive: true,
+    family: 4,
+    lookup: (hostname, options, callback) => {
+        dns.lookup(hostname, { ...options, family: 4 }, callback);
+    }
+});
+
+// === Кастомный fetch через https с IPv4 ===
+function ipv4Fetch(url, options = {}) {
+    return new Promise((resolve, reject) => {
+        const u = new URL(url);
+        const reqOptions = {
+            hostname: u.hostname,
+            port: u.port || 443,
+            path: u.pathname + u.search,
+            method: options.method || 'GET',
+            headers: options.headers || {},
+            agent: ipv4Agent
+        };
+        const req = https.request(reqOptions, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                resolve({
+                    ok: res.statusCode >= 200 && res.statusCode < 300,
+                    status: res.statusCode,
+                    statusText: res.statusMessage,
+                    headers: res.headers,
+                    text: () => Promise.resolve(data),
+                    json: () => Promise.resolve(JSON.parse(data))
+                });
+            });
+        });
+        req.on('error', reject);
+        if (options.body) req.write(options.body);
+        req.end();
+    });
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+    global: { fetch: ipv4Fetch }
+});
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -46,33 +90,25 @@ async function sendPendingCodes() {
                     `Никому не сообщайте его.`
                 );
                 await supabase.from('auth_codes').update({ sent: true }).eq('id', row.id);
-                console.log(`✅ Отправлен код ${row.code} → ${user.tag} (${row.discord_id})`);
+                console.log(`✅ Отправлен код ${row.code} → ${user.tag}`);
             } catch (err) {
                 console.error(`❌ Не смог отправить ${row.discord_id}: ${err.message}`);
                 if (err.code === 50007 || (err.message && err.message.includes('50007'))) {
                     await supabase.from('auth_codes').update({ sent: true }).eq('id', row.id);
-                    console.log(`   └ Помечен как sent — ЛС закрыты у ${row.discord_id}`);
                 }
             }
         }
-    } catch (e) {
-        console.error('Loop error:', e.message);
-    }
+    } catch (e) { console.error('Loop error:', e.message); }
 }
 
 async function cleanupOldCodes() {
     try {
         const nowIso = new Date().toISOString();
-        const r1 = await supabase.from('auth_codes').delete().eq('used', true).select();
-        if (r1.data && r1.data.length) console.log(`🧹 Удалено использованных: ${r1.data.length}`);
-        const r2 = await supabase.from('auth_codes').delete().lt('expires_at', nowIso).select();
-        if (r2.data && r2.data.length) console.log(`🧹 Удалено просроченных: ${r2.data.length}`);
+        await supabase.from('auth_codes').delete().eq('used', true);
+        await supabase.from('auth_codes').delete().lt('expires_at', nowIso);
         const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-        const r3 = await supabase.from('auth_codes').delete().lt('created_at', thirtyMinAgo).select();
-        if (r3.data && r3.data.length) console.log(`🧹 Удалено зависших: ${r3.data.length}`);
-    } catch (e) {
-        console.error('cleanup error:', e.message);
-    }
+        await supabase.from('auth_codes').delete().lt('created_at', thirtyMinAgo);
+    } catch (e) { console.error('cleanup error:', e.message); }
 }
 
 client.login(DISCORD_TOKEN);
