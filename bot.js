@@ -1,126 +1,149 @@
 require('dotenv').config();
 
-const dns = require('dns');
-if (dns.setDefaultResultOrder) dns.setDefaultResultOrder('ipv4first');
-
-const https = require('https');
-const { Client, GatewayIntentBits } = require('discord.js');
-const { createClient } = require('@supabase/supabase-js');
 const http = require('http');
+const { Client, GatewayIntentBits } = require('discord.js');
+const { Pool } = require('pg');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const DATABASE_URL = process.env.DATABASE_URL;
 
-if (!DISCORD_TOKEN || !SUPABASE_URL || !SUPABASE_KEY) {
-    console.error('❌ Не заданы переменные окружения');
-    process.exit(1);
+if (!DISCORD_TOKEN || !DATABASE_URL) {
+  console.error('❌ Не заданы DISCORD_TOKEN или DATABASE_URL');
+  process.exit(1);
 }
 
-// === IPv4-only agent для Supabase ===
-const ipv4Agent = new https.Agent({
-    keepAlive: true,
-    family: 4,
-    lookup: (hostname, options, callback) => {
-        dns.lookup(hostname, { ...options, family: 4 }, callback);
-    }
-});
-
-// === Кастомный fetch через https с IPv4 ===
-function ipv4Fetch(url, options = {}) {
-    return new Promise((resolve, reject) => {
-        const u = new URL(url);
-        const reqOptions = {
-            hostname: u.hostname,
-            port: u.port || 443,
-            path: u.pathname + u.search,
-            method: options.method || 'GET',
-            headers: options.headers || {},
-            agent: ipv4Agent
-        };
-        const req = https.request(reqOptions, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                resolve({
-                    ok: res.statusCode >= 200 && res.statusCode < 300,
-                    status: res.statusCode,
-                    statusText: res.statusMessage,
-                    headers: res.headers,
-                    text: () => Promise.resolve(data),
-                    json: () => Promise.resolve(JSON.parse(data))
-                });
-            });
-        });
-        req.on('error', reject);
-        if (options.body) req.write(options.body);
-        req.end();
-    });
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-    global: { fetch: ipv4Fetch }
-});
-
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-client.once('ready', () => {
-    console.log(`🤖 Бот запущен как ${client.user.tag}`);
-    console.log('👀 Слежу за новыми кодами в auth_codes...');
+client.once('ready', () => console.log(`🤖 Бот запущен как ${client.user.tag}`));
+
+// ===== HTTP API =====
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+
+  const path = new URL(req.url, 'http://x').pathname;
+
+  try {
+    if (path === '/api/request-code' && req.method === 'POST') {
+      const { nick } = await readBody(req);
+      if (!nick) return sendJSON(res, 400, { error: 'Введи ник' });
+      const p = await pool.query('SELECT * FROM players WHERE game_nick = $1', [nick.trim()]);
+      if (!p.rows.length) return sendJSON(res, 404, { error: 'Ник не найден' });
+      const player = p.rows[0];
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      const expires = new Date(Date.now() + 5 * 60 * 1000);
+      await pool.query('INSERT INTO auth_codes (code, discord_id, expires_at) VALUES ($1,$2,$3)', [code, player.discord_id, expires]);
+      return sendJSON(res, 200, { ok: true, discordId: player.discord_id });
+    }
+
+    if (path === '/api/verify-code' && req.method === 'POST') {
+      const { code, discordId, nick } = await readBody(req);
+      const r = await pool.query(
+        'SELECT * FROM auth_codes WHERE code=$1 AND discord_id=$2 AND used=false AND expires_at>NOW() ORDER BY created_at DESC LIMIT 1',
+        [code, discordId]
+      );
+      if (!r.rows.length) return sendJSON(res, 400, { error: 'Неверный или истёкший код' });
+      await pool.query('DELETE FROM auth_codes WHERE id=$1', [r.rows[0].id]);
+      let u = await pool.query('SELECT * FROM users WHERE discord_id=$1', [discordId]);
+      let user;
+      if (!u.rows.length) {
+        u = await pool.query('INSERT INTO users (discord_id, display_name, nickname) VALUES ($1,$2,$3) RETURNING *', [discordId, nick, nick]);
+        user = u.rows[0];
+      } else {
+        user = u.rows[0];
+        if (nick && user.nickname !== nick) {
+          await pool.query('UPDATE users SET nickname=$1, display_name=$1 WHERE id=$2', [nick, user.id]);
+          user.nickname = nick; user.display_name = nick;
+        }
+      }
+      return sendJSON(res, 200, { ok: true, user });
+    }
+
+    if (path === '/api/logs' && req.method === 'POST') {
+      const { userId, logs, periodStart, periodEnd } = await readBody(req);
+      if (!userId || !Array.isArray(logs)) return sendJSON(res, 400, { error: 'Неверные данные' });
+      for (const l of logs) {
+        await pool.query(
+          'INSERT INTO online_logs (user_id, player_nick, hours, per_day_hours, active_days, period_start, period_end) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+          [userId, l.nick, l.hours, l.perDayHours, l.activeDays, periodStart, periodEnd]
+        );
+      }
+      return sendJSON(res, 200, { ok: true, count: logs.length });
+    }
+
+    if (path === '/api/action' && req.method === 'POST') {
+      const { userId, action, details } = await readBody(req);
+      if (!userId || !action) return sendJSON(res, 400, { error: 'Неверные данные' });
+      await pool.query('INSERT INTO action_logs (user_id, action, details) VALUES ($1,$2,$3)', [userId, action, JSON.stringify(details || {})]);
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    if (path === '/api/players' && req.method === 'GET') {
+      const r = await pool.query('SELECT * FROM players ORDER BY game_nick');
+      return sendJSON(res, 200, { players: r.rows });
+    }
+
+    if (path === '/api/players' && req.method === 'POST') {
+      const { nick, discordId } = await readBody(req);
+      if (!nick || !discordId) return sendJSON(res, 400, { error: 'Заполни ник и Discord ID' });
+      if (!/^\d{15,25}$/.test(discordId)) return sendJSON(res, 400, { error: 'Discord ID — это число' });
+      try { await pool.query('INSERT INTO players (game_nick, discord_id) VALUES ($1,$2)', [nick, discordId]); }
+      catch (e) { if (e.code === '23505') return sendJSON(res, 409, { error: 'Такой ник уже есть' }); throw e; }
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    if (path.startsWith('/api/players/') && req.method === 'DELETE') {
+      const nick = decodeURIComponent(path.replace('/api/players/', ''));
+      await pool.query('DELETE FROM players WHERE game_nick=$1', [nick]);
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    sendJSON(res, 404, { error: 'Not found' });
+  } catch (e) {
+    console.error('API error:', e);
+    sendJSON(res, 500, { error: e.message });
+  }
 });
 
+function sendJSON(res, s, d) { res.writeHead(s, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(d)); }
+function readBody(req) { return new Promise((ok, err) => { let d=''; req.on('data',c=>d+=c); req.on('end',()=>{try{ok(d?JSON.parse(d):{});}catch(e){err(e);}}); req.on('error',err); }); }
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log('HTTP API on port ' + PORT));
+
+// ===== Discord: отправка кодов =====
 async function sendPendingCodes() {
-    try {
-        const { data, error } = await supabase
-            .from('auth_codes')
-            .select('*')
-            .eq('sent', false)
-            .eq('used', false)
-            .not('discord_id', 'is', null)
-            .gt('expires_at', new Date().toISOString());
-
-        if (error) { console.error('DB error:', error.message); return; }
-        if (!data || !data.length) return;
-
-        for (const row of data) {
-            try {
-                const user = await client.users.fetch(row.discord_id);
-                await user.send(
-                    `🔐 **Код для входа в Space MJ**\n\n` +
-                    `\`${row.code}\`\n\n` +
-                    `⏱️ Код действителен 5 минут.\n` +
-                    `Никому не сообщайте его.`
-                );
-                await supabase.from('auth_codes').update({ sent: true }).eq('id', row.id);
-                console.log(`✅ Отправлен код ${row.code} → ${user.tag}`);
-            } catch (err) {
-                console.error(`❌ Не смог отправить ${row.discord_id}: ${err.message}`);
-                if (err.code === 50007 || (err.message && err.message.includes('50007'))) {
-                    await supabase.from('auth_codes').update({ sent: true }).eq('id', row.id);
-                }
-            }
+  try {
+    const r = await pool.query('SELECT * FROM auth_codes WHERE sent=false AND used=false AND expires_at>NOW() AND discord_id IS NOT NULL');
+    for (const row of r.rows) {
+      try {
+        const user = await client.users.fetch(row.discord_id);
+        await user.send(`🔐 **Код для входа в Space MJ**\n\n\`${row.code}\`\n\n⏱️ Код действителен 5 минут.\nНикому не сообщайте его.`);
+        await pool.query('UPDATE auth_codes SET sent=true WHERE id=$1', [row.id]);
+        console.log(`✅ Отправлен код ${row.code} → ${user.tag}`);
+      } catch (e) {
+        console.error(`❌ Не смог отправить ${row.discord_id}: ${e.message}`);
+        if (e.code === 50007 || (e.message && e.message.includes('50007'))) {
+          await pool.query('UPDATE auth_codes SET sent=true WHERE id=$1', [row.id]);
         }
-    } catch (e) { console.error('Loop error:', e.message); }
+      }
+    }
+  } catch (e) { console.error('Loop error:', e.message); }
 }
 
 async function cleanupOldCodes() {
-    try {
-        const nowIso = new Date().toISOString();
-        await supabase.from('auth_codes').delete().eq('used', true);
-        await supabase.from('auth_codes').delete().lt('expires_at', nowIso);
-        const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-        await supabase.from('auth_codes').delete().lt('created_at', thirtyMinAgo);
-    } catch (e) { console.error('cleanup error:', e.message); }
+  try {
+    await pool.query('DELETE FROM auth_codes WHERE used=true');
+    await pool.query('DELETE FROM auth_codes WHERE expires_at<NOW()');
+    await pool.query("DELETE FROM auth_codes WHERE created_at < NOW() - INTERVAL '30 minutes'");
+  } catch (e) { console.error('cleanup error:', e.message); }
 }
 
 client.login(DISCORD_TOKEN);
 setInterval(sendPendingCodes, 3000);
-setInterval(cleanupOldCodes, 60 * 1000);
+setInterval(cleanupOldCodes, 60000);
 setTimeout(sendPendingCodes, 2000);
 setTimeout(cleanupOldCodes, 5000);
-
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Space MJ bot is running ✅');
-}).listen(PORT, () => console.log('HTTP on port ' + PORT));
