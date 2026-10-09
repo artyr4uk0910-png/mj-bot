@@ -112,65 +112,23 @@ function sendJSON(res, s, d) { res.writeHead(s, { 'Content-Type': 'application/j
 function readBody(req) { return new Promise((ok, err) => { let d=''; req.on('data',c=>d+=c); req.on('end',()=>{try{ok(d?JSON.parse(d):{});}catch(e){err(e);}}); req.on('error',err); }); }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log('HTTP API on port ' + PORT);
-  startCloudflareTunnel();
+  try {
+    const localtunnel = require('localtunnel');
+    const tunnel = await localtunnel({ port: PORT });
+    console.log('');
+    console.log('========================================');
+    console.log('🌐 API_URL (скопируй в index.html):');
+    console.log('   ' + tunnel.url);
+    console.log('========================================');
+    console.log('');
+    tunnel.on('close', () => console.log('Tunnel closed'));
+    tunnel.on('error', (e) => console.error('Tunnel error:', e.message));
+  } catch (e) {
+    console.error('❌ Localtunnel error:', e.message);
+  }
 });
-
-// ===== Cloudflare Quick Tunnel =====
-const { spawn } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const https = require('https');
-
-function downloadCloudflared(cb) {
-  const binPath = path.join(os.tmpdir(), 'cloudflared');
-  if (fs.existsSync(binPath)) return cb(null, binPath);
-
-  const url = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
-  const file = fs.createWriteStream(binPath);
-  https.get(url, (res) => {
-    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-      https.get(res.headers.location, (r2) => { r2.pipe(file); file.on('finish', () => { file.close(); fs.chmodSync(binPath, 0o755); cb(null, binPath); }); });
-    } else {
-      res.pipe(file);
-      file.on('finish', () => { file.close(); fs.chmodSync(binPath, 0o755); cb(null, binPath); });
-    }
-  }).on('error', (e) => cb(e));
-}
-
-function startCloudflareTunnel() {
-  downloadCloudflared((err, bin) => {
-    if (err) return console.error('❌ Не смог скачать cloudflared:', err.message);
-    const proc = spawn(bin, ['tunnel', '--url', 'http://localhost:' + PORT, '--no-autoupdate']);
-    proc.stdout.on('data', (data) => {
-      const text = data.toString();
-      const m = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
-      if (m) {
-        console.log('');
-        console.log('========================================');
-        console.log('🌐 API_URL (скопируй в index.html):');
-        console.log('   ' + m[0]);
-        console.log('========================================');
-        console.log('');
-      }
-    });
-    proc.stderr.on('data', (d) => {
-      const text = d.toString();
-      const m = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
-      if (m) {
-        console.log('');
-        console.log('========================================');
-        console.log('🌐 API_URL (скопируй в index.html):');
-        console.log('   ' + m[0]);
-        console.log('========================================');
-        console.log('');
-      }
-    });
-    proc.on('close', (code) => console.log('cloudflared exited with code ' + code));
-  });
-}
 
 // ===== Discord: отправка кодов =====
 async function sendPendingCodes() {
