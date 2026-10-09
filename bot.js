@@ -1,3 +1,6 @@
+const dns = require('dns');
+if (dns.setDefaultResultOrder) dns.setDefaultResultOrder('ipv4first');
+
 const { Client, GatewayIntentBits } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 const http = require('http');
